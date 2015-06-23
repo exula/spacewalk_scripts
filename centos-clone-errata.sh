@@ -26,7 +26,8 @@ NBR_DIGESTS=5
 #   export RHN_PASS=my_rhn_password
 # 2) Set them on the commandline (but I don't recommend it)
 # 3) Set them in a separate cfg file and source it (like done below)
-. /etc/ya-errata-import.cfg
+cd /root/spacewalk_scripts/
+. ya-errata-import.cfg
 
 # wget needs a proxy? Then set these (or set them also in the config file you used above)
 #export http_proxy=
@@ -71,8 +72,8 @@ ERRATADIR=/tmp/centos-errata
 
 # now do the import based on the wget results
 # !!!! change the channel parameter to your liking
-/sbin/ya-errata-import.pl --erratadir=$ERRATADIR --server $SPACEWALK --channel centos-x86_64-server-6 --os-version 6 --publish --quiet
-/sbin/ya-errata-import.pl --erratadir=$ERRATADIR --server $SPACEWALK --channel centos-x86_64-server-5 --os-version 5 --publish --quiet
+./ya-errata-import.pl --erratadir=$ERRATADIR --server $SPACEWALK --channel centos6-x86_64 --os-version 6 --publish --quiet
+./ya-errata-import.pl --erratadir=$ERRATADIR --server $SPACEWALK --channel centos7-x86_64 --os-version 7 --publish --quiet
 
 # OR do the import and get extra errata info from redhat if possible
 # change the channel parameter to your liking

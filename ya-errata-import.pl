@@ -29,6 +29,8 @@
 # 20140108 - Catch more rhn errors
 # 20140304 - Support Centos Software Collections errata
 # 20140727 - Support Spacewalk 2.2
+# 20140918 - Better centos digest parsing
+# 20150303 - Again more resilient centos message parsing
 
 # Load modules
 use strict;
@@ -46,8 +48,8 @@ use Time::Local;
 #######################################################################
 
 # Version information
-my $version = "20140304";
-my @supportedapi = ( '10.9','10.11','11.00','11.1','12','13','14','15' );
+my $version = "20150303";
+my @supportedapi = ( '10.9','10.11','11.00','11.1','12','13','14','15','16' );
 
 # Just to be sure: disable SSL certificate verification for libwww>6.0
 $ENV{'PERL_LWP_SSL_VERIFY_HOSTNAME'} = 0;
@@ -405,12 +407,102 @@ sub parse_redhat_errata($$) {
   return $xml;
 }
 
+sub parse_message($$) {
+	my ($part, $subject) = @_;
+	
+	(my $upstream_details = $part) =~ s/.*Upstream details at : (.*?)\n.*/$1/s;
+	$upstream_details =~ s/.*\>(.*)\<.*/$1/;
+	$subject =~ s/\n//gs;
+	$subject =~ s/\s+/ /g;
+	(my $advid = $subject) =~ s/(.*?) .*/$1/;
+	(my $synopsis = $subject) =~ s/.*? (.*)/$1/;
+        my $os_release;
+        if ($subject  =~ /.* (\d+) .*/) {
+                $os_release=$1;
+        } elsif ($subject  =~ /.*\-(\d+) .*/) {
+                $os_release=$1;
+        }
+
+	my $centos_xen_errata=0;
+	if ($os_release =~ /\D/) {
+	   # OS release is not an integer, happens for xen and CSL errata
+	   # so we just set it to the OS release, the package details will later point
+	   # out if the advisory can be applied or not
+	   $os_release = $opt_os_version;
+	   if ($subject =~ /xen/i) {
+		# xen errata need special treatment because of different format
+		$centos_xen_errata=1;
+	   }
+	}
+
+	if ($os_release != $opt_os_version) {
+		return;
+	}
+
+	# now get the packages per architecture
+	my $i386_packages="";
+	my $x86_64_packages="";
+	if ($centos_xen_errata) {
+		($part =~ /I386/s) && (($i386_packages = $part) =~ s/.*I386\s*\n\-+\n(.*?)\n\n.*/$1/s);
+		($part =~ /X86_64/s) && (($x86_64_packages = $part) =~ s/.*X86_64\s*\n\-+\n(.*?)\n\n.*/$1/s);
+	} else {
+		($part =~ /i386:/s) && (($i386_packages = $part) =~ s/.*i386:\n(.*?)\n\n.*/$1/s);
+		($part =~ /x86_64:/s) && (($x86_64_packages = $part) =~ s/.*x86_64:\n(.*?)\n\n.*/$1/s);
+	}
+	# remove first empty line
+	$i386_packages =~ s/^\n//;
+	$x86_64_packages =~ s/^\n//;
+	# remove emtpy lines
+	$i386_packages =~ s/\n\s*\n/\n/g;
+	$x86_64_packages =~ s/\n\s*\n/\n/g;
+	# remove last empty line
+	$i386_packages =~ s/\n\s*$//;
+	$x86_64_packages =~ s/\n\s*$//;
+	debug("$advid i386 packages info found:\n$i386_packages\n");
+	debug("$advid x86_64 packages info found:\n$x86_64_packages\n");
+	my @i386_packages = split(/\n/s,$i386_packages);
+	my @x86_64_packages = split(/\n/s,$x86_64_packages);
+	# remove the checksum info
+	s/\S+\s+// for @i386_packages;
+	s/\S+\s+// for @x86_64_packages;
+	
+	my $adv_type="";
+	if (substr($advid,2,2) eq "SA") { $adv_type="Security Advisory";}
+	elsif (substr($advid,2,2) eq "BA") { $adv_type="Bug Fix Advisory";}
+	elsif (substr($advid,2,2) eq "EA") { $adv_type="Product Enhancement Advisory";}
+	else {
+		# something undetermined
+		return;
+	}
+	
+	my $adv={};
+	$adv->{'synopsis'}=$synopsis;
+	$adv->{'release'}=1;
+	$adv->{'type'}=$adv_type;
+	$adv->{'advisory_name'}=$advid;
+	$adv->{'product'}="CentOS Linux";
+	$adv->{'topic'}="not available";
+	$adv->{'description'}="not available";
+	$adv->{'notes'}="not available";
+	$adv->{'solution'}="not available";
+	$adv->{'os_release'}=$os_release;
+	$adv->{'references'}="$upstream_details";
+	# depending on the value off opt_acrhitecture, one of the following 2 will be used
+	$adv->{'i386_packages'}=\@i386_packages;
+	$adv->{'x86_64_packages'}=\@x86_64_packages;
+	# the next is just to be able to skip looking for xen errata in rhn, when that option is choosen
+	if ($centos_xen_errata) {
+		$adv->{'centos_xen_errata'}=1;
+	}
+	return $adv;
+}
+
 sub parse_archivedir() {
   opendir(my $dh, $opt_erratadir) || die "can't opendir $opt_erratadir: $!";
   my @files = grep { !/^\./ && -f "$opt_erratadir/$_" } readdir($dh);
   closedir $dh;
 
-  my $xml;
+  my $xml = {};
 
   foreach my $file (@files) {
 	local $/=undef;
@@ -418,92 +510,43 @@ sub parse_archivedir() {
 	my $string = <IN>;
 	close(IN);
 	local $/="\n";
+
+	if($string =~ /\<TITLE\>\s+\[CentOS-announce\]\s+CE/) {
+		debug("Single archive: $opt_erratadir/$file\n");
+		my $part = $string;
+
+		(my $subject = $part) =~ s/.*\<TITLE\> \[CentOS-announce\] (CE.*?)\<\/TITLE\>.*/$1/s;
+		$part =~ s/.*\<PRE\>(.*?)\<\/PRE\>.*/$1/s;
+
+		my $adv = parse_message($part, $subject);
+
+		if(!defined $adv) {
+			next;
+		}
+
+		$xml->{$adv->{'advisory_name'}}=$adv;
+	} elsif($string =~ /\<TITLE\>\s+\[CentOS\]\s+CentOS-announce\s+Digest/) {
+		debug("Multiple archive: $opt_erratadir/$file\n");
+		
+		my @parts = split(/Message:/,$string);
+		# skip the first part, since it's general info
+		shift(@parts);
+		foreach my $part (@parts) {
+			my $subject=$part;
+			# concat the lines starting with white spaces to the previous line
+        		$subject =~ s/\n\s+/ /gs;
+
+			if ($subject !~ /Subject: \[CentOS-announce\] CE/s) {
+				next;
+			}
+			$subject =~ s/.*Subject: \[CentOS-announce\] (CE.*?)\n.*/$1/s;
+			#print "$subject\n";
 	
-	my @parts = split(/Message:/,$string);
-	# skip the first part, since it's general info
-	shift(@parts);
-	foreach my $part (@parts) {
-		if ($part !~ /Subject: \[CentOS-announce\] CE/s) {
-			next;
-		}
-		(my $subject = $part) =~ s/.*Subject: \[CentOS-announce\] (CE.*?)To:.*/$1/s;
-		(my $upstream_details = $part) =~ s/.*Upstream details at : (.*?)\n.*/$1/s;
-		$subject =~ s/\n//gs;
-		$subject =~ s/\s+/ /g;
-		$upstream_details =~ s/.*\>(.*)\<.*/$1/;
-		(my $advid = $subject) =~ s/(.*?) .*/$1/;
-		(my $synopsis = $subject) =~ s/.*? (.*)/$1/;
-		(my $os_release = $subject) =~ s/.* (\d+) .*/$1/;
-		
-		my $centos_xen_errata=0;
-		if ($os_release =~ /\D/) {
-                   # OS release is not an integer, happens for xen and CSL errata
-                   # so we just set it to the OS release, the package details will later point
-                   # out if the advisory can be applied or not
-                   $os_release = $opt_os_version;
-                   if ($subject =~ /xen/i) {
-                   	# xen errata need special treatment because of different format
-		   	$centos_xen_errata=1;
-                   }
-                }
-
-		if ($os_release != $opt_os_version) {
-			next;
-		}
-
-		# now get the packages per architecture
-		my $i386_packages="";
-		my $x86_64_packages="";
-		if ($centos_xen_errata) {
-			($part =~ /I386/s) && (($i386_packages = $part) =~ s/.*I386\s*\n\-+\n(.*?)\n\n.*/$1/s);
-			($part =~ /X86_64/s) && (($x86_64_packages = $part) =~ s/.*X86_64\s*\n\-+\n(.*?)\n\n.*/$1/s);
-		} else {
-			($part =~ /i386:/s) && (($i386_packages = $part) =~ s/.*i386:\n(.*?)\n\n.*/$1/s);
-			($part =~ /x86_64:/s) && (($x86_64_packages = $part) =~ s/.*x86_64:\n(.*?)\n\n.*/$1/s);
-		}
-		# remove first empty line
-		$i386_packages =~ s/^\n//;
-		$x86_64_packages =~ s/^\n//;
-		# remove emtpy lines
-		$i386_packages =~ s/\n\s*\n/\n/g;
-		$x86_64_packages =~ s/\n\s*\n/\n/g;
-		# remove last empty line
-		$i386_packages =~ s/\n\s*$//;
-		$x86_64_packages =~ s/\n\s*$//;
-		debug("$advid i386 packages info found:\n$i386_packages\n");
-		debug("$advid x86_64 packages info found:\n$x86_64_packages\n");
-		my @i386_packages = split(/\n/s,$i386_packages);
-		my @x86_64_packages = split(/\n/s,$x86_64_packages);
-		# remove the checksum info
-		s/\S+\s+// for @i386_packages;
-		s/\S+\s+// for @x86_64_packages;
-		
-		my $adv_type="";
-		if (substr($advid,2,2) eq "SA") { $adv_type="Security Advisory";}
-		elsif (substr($advid,2,2) eq "BA") { $adv_type="Bug Fix Advisory";}
-		elsif (substr($advid,2,2) eq "EA") { $adv_type="Product Enhancement Advisory";}
-		else {
-			# something undetermined: we skip it
-			next;
-		}
-		$xml->{$advid}={};
-		$xml->{$advid}->{'synopsis'}=$synopsis;
-		$xml->{$advid}->{'release'}=1;
-		$xml->{$advid}->{'type'}=$adv_type;
-		$xml->{$advid}->{'advisory_name'}=$advid;
-		$xml->{$advid}->{'product'}="CentOS Linux";
-		$xml->{$advid}->{'topic'}="not available";
-		$xml->{$advid}->{'description'}="not available";
-		$xml->{$advid}->{'notes'}="not available";
-		$xml->{$advid}->{'solution'}="not available";
-		$xml->{$advid}->{'os_release'}=$os_release;
-		$xml->{$advid}->{'references'}="$upstream_details";
-		# depending on the value off opt_acrhitecture, one of the following 2 will be used
-		$xml->{$advid}->{'i386_packages'}=\@i386_packages;
-		$xml->{$advid}->{'x86_64_packages'}=\@x86_64_packages;
-		# the next is just to be able to skip looking for xen errata in rhn, when that option is choosen
-		if ($centos_xen_errata) {
-			$xml->{$advid}->{'centos_xen_errata'}=1;
+			my $adv = parse_message($part, $subject);
+			if (!defined($adv->{'advisory_name'})) {
+				next;
+			}
+			$xml->{$adv->{'advisory_name'}}=$adv;
 		}
 	}
   }
@@ -1049,8 +1092,7 @@ foreach my $advid (sort(keys(%{$xml}))) {
 
   # Generate OVAL ID for redhat security errata
   $ovalid = "";
-  if ($advid =~ /CESA|CLSA/ && !$centos_xen_errata) {
-    $advid =~ /..SA-(\d+):(\d+)/;
+  if (!$centos_xen_errata && $advid =~ /(CESA|CLSA)-(\d+):(\d+)/) {
     $ovalid = "oval:com.redhat.rhsa:def:$1".sprintf("%04d", $2);
     debug("Processing $advid -- OVAL ID is $ovalid\n");
   }
