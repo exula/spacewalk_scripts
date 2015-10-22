@@ -29,7 +29,7 @@ do
  	REPOURL=`spacewalk-api --server=127.0.0.1 --user $SPACEWALK_USER --password $SPACEWALK_PASS channel.software.getDetails "%session%" "$CHANNELNAME" | grep gpg_key_url | awk -F \' '{print $4}'`
 	
 	KEYS[$I]=$REPOURL;
-#	spacewalk-repo-sync -q --channel=$CHANNELNAME
+	spacewalk-repo-sync -q --channel=$CHANNELNAME
 	CHANNELNAME="";
 	I=$((I+1))
 done
